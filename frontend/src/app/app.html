@@ -1,0 +1,35 @@
+<div class="app-container">
+  <header class="app-header">
+    <img src="logo-utn.png" alt="UTN FRCU Logo" class="utn-logo">
+
+    <div class="header-text">
+      <h1>{{ title() }}</h1>
+      <p>Gestión Avanzada de Datos 2025 - UTN FRCU</p>
+    </div>
+
+    <div class="model-selector">
+      <span class="model-label">Modelo:</span>
+      <div class="model-buttons">
+        <button 
+          (click)="setModel('1_layer')" 
+          [class.active]="activeModel === '1_layer'"
+          [disabled]="activeModel === '1_layer'">
+          1 Capa
+        </button>
+        <button 
+          (click)="setModel('2_layers')" 
+          [class.active]="activeModel === '2_layers'"
+          [disabled]="activeModel === '2_layers'">
+          2 Capas
+        </button>
+      </div>
+    </div>
+  </header>
+
+  <main class="main-content">
+    <app-upload></app-upload>
+    <app-search></app-search>
+  </main>
+  
+  <app-search-results></app-search-results>
+</div>
