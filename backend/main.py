@@ -32,6 +32,8 @@ import shutil
 import uuid
 import faiss, pickle, numpy as np
 from features.features import extract_mixed_features, _ensure_model, set_active_layer_config
+import subprocess
+import sys
 from io import BytesIO
 from PIL import Image
 
@@ -56,19 +58,126 @@ active_model = "1_layer"
 def load_model_data(model_key):
     idx_path = MODELS[model_key]["index_path"]
     feats_path = MODELS[model_key]["features_path"]
-    index = faiss.read_index(str(idx_path))
-    with open(feats_path, "rb") as f:
-        data = pickle.load(f)
-    dataset_features = list(data["features"])
-    dataset_paths = data["paths"]
+
+    # Ensure extractor is configured for this model so we can determine vector dimension if needed
+    try:
+        set_active_layer_config(model_key)
+    except Exception:
+        pass
+
+    index = None
+    dataset_features = []
+    dataset_paths = []
+
+    # Load features pickle if present
+    if feats_path.exists():
+        try:
+            with open(feats_path, "rb") as f:
+                data = pickle.load(f)
+            dataset_features = list(data.get("features", []))
+            dataset_paths = data.get("paths", [])
+        except Exception as e:
+            print(f"[LOAD MODEL] Warning: no se pudo leer features en {feats_path}: {e}")
+
+    # Load or create FAISS index. If index file missing, create a new empty index
+    if idx_path.exists():
+        try:
+            index = faiss.read_index(str(idx_path))
+        except Exception as e:
+            print(f"[LOAD MODEL] Warning: no se pudo leer índice FAISS en {idx_path}: {e}")
+            index = None
+
+    if index is None:
+        # Try to infer dimension from extractor by running a dummy image through it
+        try:
+            import numpy as _np
+            dummy = _np.zeros((224, 224, 3), dtype=_np.uint8)
+            vec = extract_mixed_features(dummy)
+            dim = int(len(vec))
+        except Exception as e:
+            print(f"[LOAD MODEL] Warning: no se pudo inferir dimensión de features: {e}")
+            # Fallback conservative default
+            dim = 2048
+        index = faiss.IndexFlatL2(dim)
+
+    # If we loaded an index with entries but have no dataset paths, try to rebuild
+    try:
+        if getattr(index, 'ntotal', 0) > 0 and len(dataset_paths) == 0:
+            print(f"[LOAD MODEL] Índice {model_key} tiene {index.ntotal} entradas pero no hay paths; intentando rebuild automático...")
+            try:
+                rebuild_index_for_model(model_key)
+                # reload after rebuild
+                index, dataset_features, dataset_paths = load_model_data(model_key)
+            except Exception as e:
+                print(f"[LOAD MODEL] Rebuild automático falló para {model_key}: {e}")
+    except Exception:
+        pass
+
     return index, dataset_features, dataset_paths
+
+
+def rebuild_index_for_model(model_key):
+    """Attempt to rebuild the FAISS index for the given model_key using available scripts or PKL files.
+
+    This will run scripts located under backend/models/<subdir> when present, or recreate the index
+    from the features pickle if available.
+    """
+    base_models_dir = Path(__file__).parent / "models"
+    # Special-case known subdir for 2_layers
+    subdirs = ["modelo_2_layers", "modelos_base"]
+    target_dir = None
+    for sd in subdirs:
+        d = base_models_dir / sd
+        if d.exists():
+            # check for presence of model-specific files
+            if model_key == "2_layers" and sd == "modelo_2_layers":
+                target_dir = d
+                break
+    # If no specific dir chosen, use base models dir
+    if target_dir is None:
+        target_dir = base_models_dir
+
+    # Look for known rebuild scripts
+    scripts = ["rebuild_index_normalized.py", "create_faiss_index_2_layers.py"]
+    for s in scripts:
+        script_path = target_dir / s
+        if script_path.exists():
+            print(f"[REBUILD] Ejecutando script: {script_path}")
+            subprocess.run([sys.executable, str(script_path)], check=True)
+            # after running script, try to reload index file
+            return True
+
+    # Fallback: try to recreate index from the PKL referenced in MODELS
+    feats_path = MODELS[model_key]["features_path"]
+    idx_path = MODELS[model_key]["index_path"]
+    if feats_path.exists():
+        try:
+            with open(feats_path, "rb") as f:
+                data = pickle.load(f)
+            features = np.array(data.get("features", []), dtype="float32")
+            if features.size == 0:
+                raise RuntimeError("No hay features en el PKL para reconstruir el índice")
+            dim = features.shape[1]
+            index = faiss.IndexFlatL2(dim)
+            index.add(features)
+            faiss.write_index(index, str(idx_path))
+            print(f"[REBUILD] Índice reconstruido desde {feats_path} y guardado en {idx_path}")
+            return True
+        except Exception as e:
+            raise RuntimeError(f"No se pudo reconstruir índice desde {feats_path}: {e}")
+
+    raise RuntimeError(f"No se encontró script de rebuild ni PKL para el modelo {model_key}")
 
 # Inicializar ambos modelos en memoria
 model_data = {}
 for key in MODELS:
     model_data[key] = {}
     model_data[key]["index"], model_data[key]["features"], model_data[key]["paths"] = load_model_data(key)
-
+# Restaurar configuración de capas al modelo activo después de inicializar índices
+try:
+    set_active_layer_config(active_model)
+except Exception:
+    pass
 def get_active():
     return model_data[active_model]["index"], model_data[active_model]["features"], model_data[active_model]["paths"]
 
@@ -213,6 +322,11 @@ async def search_image(
     try:
         global active_model, model_data
         index, dataset_features, dataset_paths = get_active()
+        # Ensure lists exist
+        if dataset_features is None:
+            dataset_features = []
+        if dataset_paths is None:
+            dataset_paths = []
         # Leer imagen en memoria (PIL) y extraer features directamente
         contents = await file.read()
         img = Image.open(BytesIO(contents))
@@ -222,33 +336,55 @@ async def search_image(
         feats = np.array([feats]).astype("float32")
 
         # Buscar en FAISS
-        distances, indices = index.search(feats, k)
+        # Verify dimensions match
+        try:
+            idx_dim = getattr(index, 'd', None)
+            vec_dim = feats.shape[1]
+            if idx_dim is not None and vec_dim != idx_dim:
+                raise HTTPException(status_code=500, detail=f"Dimension mismatch: index.d={idx_dim} vs feature_vector={vec_dim}. Rebuild index or reset model configuration.")
+            distances, indices = index.search(feats, k)
+        except AssertionError as ae:
+            raise HTTPException(status_code=500, detail=f"FAISS assertion error during search: {ae}")
+        except HTTPException:
+            raise
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"Error running FAISS search: {e}")
 
         results = []
         base_url = str(request.base_url).rstrip('/')
         for dist, idx in zip(distances[0], indices[0]):
-            if radius is None or dist <= radius:
-                entry = dataset_paths[idx]
-                rel_path = str(entry).replace("\\", "/")
-                fname = Path(rel_path).name
+            # idx can be -1 for invalid results; skip those
+            if idx is None or int(idx) < 0:
+                print(f"[SEARCH DEBUG] skipping invalid idx={idx}")
+                continue
+            idx = int(idx)
+            if radius is not None and dist > radius:
+                continue
+            if idx >= len(dataset_paths):
+                print(f"[SEARCH DEBUG] idx out of range: {idx} >= {len(dataset_paths)}; skipping")
+                continue
 
-                # DEBUG
-                full_path = UPLOAD_DIR / fname
-                exists = full_path.exists()
-                print(f"[SEARCH DEBUG] idx={idx}, entry={entry}, fname={fname}, existe={exists}")
-                if not exists:
-                    print(f"[SEARCH SKIP] Omitiendo resultado porque falta archivo: {full_path}")
-                    continue
+            entry = dataset_paths[idx]
+            rel_path = str(entry).replace("\\", "/")
+            fname = Path(rel_path).name
 
-                # Siempre servir desde /sitios usando solo el nombre de archivo
-                url = f"{base_url}/sitios/{fname}"
+            # DEBUG
+            full_path = UPLOAD_DIR / fname
+            exists = full_path.exists()
+            print(f"[SEARCH DEBUG] idx={idx}, entry={entry}, fname={fname}, existe={exists}")
+            if not exists:
+                print(f"[SEARCH SKIP] Omitiendo resultado porque falta archivo: {full_path}")
+                continue
 
-                image_id = fname.split('.')[0]
-                results.append({
-                    "id": image_id,
-                    "url": url,
-                    "distance": float(dist)
-                })
+            # Siempre servir desde /sitios usando solo el nombre de archivo
+            url = f"{base_url}/sitios/{fname}"
+
+            image_id = fname.split('.')[0]
+            results.append({
+                "id": image_id,
+                "url": url,
+                "distance": float(dist)
+            })
 
         return {"results": results}
     except Exception as e:
@@ -291,6 +427,39 @@ def debug_files():
         "files": [f.name for f in files],
         "count": len(files)
     }
+
+
+@app.get('/debug/index')
+def debug_index():
+    """Devuelve información de índices FAISS y datasets cargados para cada modelo."""
+    info = {}
+    for key in MODELS:
+        entry = model_data.get(key, {})
+        idx = entry.get("index")
+        feats = entry.get("features")
+        paths = entry.get("paths")
+        try:
+            dim = getattr(idx, 'd', None)
+            ntotal = getattr(idx, 'ntotal', None)
+        except Exception:
+            dim = None
+            ntotal = None
+        # Try to infer feature vector length from in-memory features
+        feat_dim = None
+        if isinstance(feats, (list, tuple)) and len(feats) > 0:
+            try:
+                feat_dim = len(feats[0])
+            except Exception:
+                feat_dim = None
+
+        info[key] = {
+            "index_dim": dim,
+            "index_ntotal": ntotal,
+            "features_count": len(feats) if feats is not None else 0,
+            "paths_count": len(paths) if paths is not None else 0,
+            "feature_vector_dim": feat_dim,
+        }
+    return info
 
 
 
