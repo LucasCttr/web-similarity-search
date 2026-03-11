@@ -4,19 +4,9 @@ La aplicación permite subir una imagen de consulta y devuelve los 10 objetos m�
 
 **Demo**
 
-Aquí hay una demostración en video del funcionamiento de la aplicación. Puedes reproducirlo directamente desde este repositorio:
-
-
-
+Aquí hay una demostración en video del funcionamiento de la aplicación:
 
 https://github.com/user-attachments/assets/37415a3b-2398-475d-b67f-1609e2761951
-
-
-
-<video controls width="640">
-	<source src="assets/demo.mp4" type="video/mp4">
-	Tu navegador no soporta la reproducción de video.
-</video>
 
 También puedes abrir el archivo directamente: [assets/demo.mp4](assets/demo.mp4)
 
