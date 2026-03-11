@@ -47,5 +47,3 @@ Frontend:
 2. Abrir terminal en `frontend`
 ```
 npm install
-
-
